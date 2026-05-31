@@ -15,7 +15,7 @@ sessions arrive in later phases (see Roadmap).
 - **LM Studio** running its local server (Developer → Start Server) at
   `http://localhost:1234/v1`, with **two models loaded**:
   - a larger *brain* model for chat/reasoning (e.g. a Qwen3-class ~27–30B model)
-  - a small *utility* model for cheap summarization (e.g. Gemma 3n E4B)
+  - a small *utility* model for cheap summarization (e.g. Gemma 4 E4B)
 
 Model ids are **never hardcoded** — LocalBuddy reads them from `GET /v1/models`
 and lets you pick (or pin them via configuration).
