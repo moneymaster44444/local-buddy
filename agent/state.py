@@ -88,6 +88,10 @@ class Conversation:
     def clear(self) -> None:
         self.messages = []
 
+    def transcript(self) -> str:
+        """Render the full conversation as plain text (for /remember summaries)."""
+        return _render_transcript(self.messages)
+
     def estimated_tokens(self) -> int:
         chars = sum(len(message_text(m)) for m in self.messages)
         return int(chars / self.settings.chars_per_token)

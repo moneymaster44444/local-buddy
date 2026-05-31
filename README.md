@@ -49,6 +49,7 @@ reports and asks you to choose a brain and a utility model.
 | `/model utility [id\|#]` | Switch the utility model (interactive picker if no id) |
 | `/tools [reset\|revoke <tool>]` | List tools & approvals; `revoke <tool>` downshifts one, `reset` clears all session auto-approvals |
 | `/ingest <path>` | Add a text/Markdown file or folder to the knowledge base (RAG) |
+| `/remember [text]` | Save a note — or, with no text, a summary of this conversation — to memory |
 | `/memory` | Show knowledge base stats (chunks, sources, embedder) |
 | `/forget` | Clear the knowledge base |
 | `/clear` | Clear the conversation |
@@ -109,6 +110,11 @@ Give LocalBuddy your own documents and let it retrieve from them:
   paths resolve inside the workspace** (where the agent's `write_file` lands), so
   `/ingest notes.txt` finds `workspace/notes.txt`; use an absolute path for files
   elsewhere.
+- **Remember:** `/remember <text>` saves a note; bare `/remember` summarizes the
+  *current conversation* (via the utility model) and saves that — so a future
+  session can recall the gist. Both are embedded and stored like any other entry,
+  tagged `note:<time>` / `conversation:<time>`. (Note: this is long-term recall via
+  RAG — *resuming* a whole session verbatim is Phase 4.)
 - **Retrieve:** the agent has a read-only **`search_memory`** tool it calls when a
   question might be answered by your documents — it embeds the query, pulls the top
   matches, and grounds its answer in them (no approval needed; it's read-only).
