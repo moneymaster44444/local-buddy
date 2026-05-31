@@ -16,6 +16,7 @@ import asyncio
 import json
 import signal
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -41,7 +42,14 @@ from .llm import (
     make_client,
 )
 from .loop import run_turn
-from .memory import EmbeddingError, MemorySearcher, MemoryStore, embed_texts, ingest_path
+from .memory import (
+    EmbeddingError,
+    MemorySearcher,
+    MemoryStore,
+    embed_texts,
+    ingest_path,
+    ingest_text,
+)
 from .state import Conversation
 from .tools import UNSANDBOXED_TOOLS, AgentDeps, build_tools
 from .tools.approval import Asker
@@ -100,6 +108,7 @@ def print_help(console: Console) -> None:
     table.add_row("/model utility [id|#]", "Switch the utility (summary) model — picker if no id given")
     table.add_row("/tools [reset|revoke <tool>]", "List tools & approvals; revoke one or reset all session auto-approvals")
     table.add_row("/ingest <path>", "Add a text/Markdown file or folder to the knowledge base (RAG)")
+    table.add_row("/remember [text]", "Save a note (or, with no text, a summary of this conversation) to memory")
     table.add_row("/memory", "Show knowledge base stats (chunks, sources, embedder)")
     table.add_row("/forget", "Clear the knowledge base")
     table.add_row("/clear", "Clear the conversation history")
@@ -249,6 +258,10 @@ async def handle_command(
     if cmd == "/ingest":
         rest = line.split(maxsplit=1)
         await _handle_ingest(console, session, state, rest[1].strip() if len(rest) > 1 else "")
+        return False
+    if cmd == "/remember":
+        rest = line.split(maxsplit=1)
+        await _handle_remember(console, session, state, rest[1].strip() if len(rest) > 1 else "")
         return False
     if cmd == "/memory":
         await _print_memory(console, state)
@@ -450,11 +463,21 @@ async def _handle_ingest(
         console.print("[yellow]Memory is disabled (LOCALBUDDY_ENABLE_MEMORY=false).[/yellow]")
         return
     if not raw_path:
-        console.print("[red]Usage:[/red] /ingest <path>   (a text/Markdown file or folder)")
+        console.print("[red]Usage:[/red] /ingest <path>   (relative paths are taken from the workspace)")
         return
-    path = Path(raw_path.strip().strip('"').strip("'")).expanduser()
+    # Relative paths resolve against the workspace (where the agent's write_file
+    # tool puts files); absolute paths are used as-is so you can index anything.
+    workspace = state.settings.workspace_path()
+    candidate = Path(raw_path.strip().strip('"').strip("'")).expanduser()
+    if not candidate.is_absolute():
+        candidate = workspace / candidate
+    path = candidate.resolve()
     if not path.exists():
         console.print(f"[red]Path not found:[/red] {path}")
+        console.print(
+            f"[dim]Relative paths resolve inside the workspace ({workspace}); "
+            "use an absolute path for files elsewhere.[/dim]"
+        )
         return
     if not await _ensure_embedder(console, session, state):
         return
@@ -480,6 +503,73 @@ async def _handle_ingest(
     if result.skipped:
         console.print(f"[dim]skipped {len(result.skipped)} undecodable/binary file(s).[/dim]")
     console.print(f"[dim]knowledge base now holds {await mem.count()} chunk(s).[/dim]")
+
+
+_REMEMBER_PROMPT = """\
+Summarize the following conversation into a concise note for long-term memory.
+Capture the key facts, decisions, the user's preferences, names, identifiers, and
+any conclusions, written as standalone notes that will still make sense later,
+out of context. Do not add anything that is not in the conversation.
+
+--- CONVERSATION ---
+{transcript}
+--- END ---
+
+Memory note:"""
+
+
+async def _handle_remember(
+    console: Console, session: PromptSession, state: AppState, text: str
+) -> None:
+    mem = state.memory
+    if mem is None:
+        console.print("[yellow]Memory is disabled (LOCALBUDDY_ENABLE_MEMORY=false).[/yellow]")
+        return
+
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    if text:
+        content, source, label = text, f"note:{stamp}", "note"
+    else:
+        if not state.conversation.messages:
+            console.print("[yellow]Nothing to remember yet — the conversation is empty.[/yellow]")
+            return
+        try:
+            with console.status("[dim]summarizing the conversation…[/dim]"):
+                result = await state.utility_agent.run(
+                    _REMEMBER_PROMPT.format(transcript=state.conversation.transcript()),
+                    model=state.utility_model,
+                    model_settings={"temperature": 0.2, "max_tokens": state.settings.summary_max_tokens},
+                )
+        except Exception as exc:  # noqa: BLE001 - surface, don't crash the REPL
+            console.print(f"[red]Could not summarize the conversation:[/red] {exc}")
+            return
+        content = result.output.strip()
+        source, label = f"conversation:{stamp}", "conversation summary"
+        console.print(Panel(escape(content), title="remembering this summary", border_style="cyan", expand=False))
+
+    if not content.strip():
+        console.print("[yellow]Nothing to remember (empty content).[/yellow]")
+        return
+    if not await _ensure_embedder(console, session, state):
+        return
+
+    async def embed(texts: list[str]) -> list[list[float]]:
+        return await embed_texts(state.client, mem.embedder_model_id, texts, state.settings.embed_batch_size)
+
+    try:
+        with console.status("[dim]saving to the knowledge base…[/dim]"):
+            res = await ingest_text(
+                mem.store, embed, content, source,
+                chunk_chars=state.settings.chunk_chars,
+                chunk_overlap=state.settings.chunk_overlap,
+            )
+    except EmbeddingError as exc:
+        console.print(f"[red]Could not save:[/red] {exc}")
+        return
+    console.print(
+        f"[green]Remembered[/green] {label} as [bold]{source}[/bold] "
+        f"({res.chunks} chunk(s)). Knowledge base now holds {await mem.count()} chunk(s)."
+    )
 
 
 async def _handle_forget(console: Console, state: AppState) -> None:

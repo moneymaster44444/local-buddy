@@ -60,6 +60,32 @@ def iter_text_files(path: Path) -> list[Path]:
     ]
 
 
+async def ingest_text(
+    store: MemoryStore,
+    embed: EmbedFn,
+    text: str,
+    source: str,
+    *,
+    chunk_chars: int,
+    chunk_overlap: int,
+) -> IngestResult:
+    """Chunk, embed, and store a raw string under ``source`` (e.g. a note/summary)."""
+    result = IngestResult()
+    chunks = chunk_text(text, chunk_chars, chunk_overlap)
+    if not chunks:
+        return result
+    await store.delete_sources([source])  # replace if this exact source already exists
+    vectors = await embed(chunks)
+    rows = [
+        {"vector": v, "text": c, "source": source, "chunk_index": i}
+        for i, (c, v) in enumerate(zip(chunks, vectors))
+    ]
+    await store.add(rows)
+    result.files = 1
+    result.chunks = len(rows)
+    return result
+
+
 async def ingest_path(
     store: MemoryStore,
     embed: EmbedFn,
