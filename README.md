@@ -105,7 +105,10 @@ Give LocalBuddy your own documents and let it retrieve from them:
 - **Ingest:** `/ingest <path>` chunks a text/Markdown file (or every text file in
   a folder), embeds each chunk via LM Studio's embedding model, and stores it in a
   local **LanceDB** index under `data/lancedb/`. Re-ingesting a path replaces its
-  previous chunks. `/memory` shows stats; `/forget` clears the index.
+  previous chunks. `/memory` shows stats; `/forget` clears the index. **Relative
+  paths resolve inside the workspace** (where the agent's `write_file` lands), so
+  `/ingest notes.txt` finds `workspace/notes.txt`; use an absolute path for files
+  elsewhere.
 - **Retrieve:** the agent has a read-only **`search_memory`** tool it calls when a
   question might be answered by your documents — it embeds the query, pulls the top
   matches, and grounds its answer in them (no approval needed; it's read-only).

@@ -450,11 +450,21 @@ async def _handle_ingest(
         console.print("[yellow]Memory is disabled (LOCALBUDDY_ENABLE_MEMORY=false).[/yellow]")
         return
     if not raw_path:
-        console.print("[red]Usage:[/red] /ingest <path>   (a text/Markdown file or folder)")
+        console.print("[red]Usage:[/red] /ingest <path>   (relative paths are taken from the workspace)")
         return
-    path = Path(raw_path.strip().strip('"').strip("'")).expanduser()
+    # Relative paths resolve against the workspace (where the agent's write_file
+    # tool puts files); absolute paths are used as-is so you can index anything.
+    workspace = state.settings.workspace_path()
+    candidate = Path(raw_path.strip().strip('"').strip("'")).expanduser()
+    if not candidate.is_absolute():
+        candidate = workspace / candidate
+    path = candidate.resolve()
     if not path.exists():
         console.print(f"[red]Path not found:[/red] {path}")
+        console.print(
+            f"[dim]Relative paths resolve inside the workspace ({workspace}); "
+            "use an absolute path for files elsewhere.[/dim]"
+        )
         return
     if not await _ensure_embedder(console, session, state):
         return
