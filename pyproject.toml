@@ -3,6 +3,8 @@ name = "localbuddy"
 version = "0.1.0"
 description = "A local-first CLI AI agent backed by LM Studio (Phase 2: chat + sandboxed tools)."
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.12"
 dependencies = [
     "httpx>=0.28.1",
