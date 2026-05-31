@@ -1,0 +1,3 @@
+# Normalize line endings: store as LF in the repo, check out native on each OS.
+* text=auto
+*.py text eol=lf

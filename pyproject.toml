@@ -1,0 +1,24 @@
+[project]
+name = "localbuddy"
+version = "0.1.0"
+description = "A local-first CLI AI agent backed by LM Studio (Phase 2: chat + sandboxed tools)."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "httpx>=0.28.1",
+    "prompt-toolkit>=3.0.52",
+    "pydantic-ai-slim[openai]>=1.104.0",
+    "pydantic-settings>=2.14.1",
+    "rich>=15.0.0",
+    "trafilatura>=2.0.0",
+]
+
+[project.scripts]
+localbuddy = "agent.repl:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["agent"]

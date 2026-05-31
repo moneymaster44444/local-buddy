@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Virtual env / build
+.venv/
+dist/
+build/
+
+# uv / tooling
+.python-version
+
+# Local config & runtime data (sqlite, lancedb, repl history) — Phase 1+
+.env
+.env.*
+!.env.example
+data/
+
+# Tool filesystem sandbox (Phase 2)
+workspace/
+
+# Editor / OS / local tooling
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+.claude/settings.local.json
