@@ -42,7 +42,10 @@ class Settings(BaseSettings):
     history_token_budget: int = 6000  # estimated-token ceiling before summarizing
     keep_recent_turns: int = 4  # most-recent user+assistant turns kept verbatim
     chars_per_token: float = 4.0  # heuristic: ~4 chars/token (no tokenizer dependency)
-    summary_max_tokens: int = 512  # cap on the generated summary length
+    # Token budget for a summary generation call. Must leave room for a
+    # reasoning/"thinking" model to think AND emit the summary text (we keep only
+    # the text); too small and the model burns the budget before answering.
+    summary_max_tokens: int = 2048
 
     # --- Tools (Phase 2) ---
     enable_tools: bool = True  # set false for pure Phase-1 chat with no tools
