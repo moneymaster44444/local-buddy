@@ -53,7 +53,7 @@ def build_brain_agent(settings: Settings) -> Agent[AgentDeps, str]:
     """The main reasoning/chat agent, with tools registered when enabled. The
     concrete model is supplied per run, so switching the brain model at runtime
     needs no agent rebuild."""
-    tools = build_tools() if settings.enable_tools else []
+    tools = build_tools(settings) if settings.enable_tools else []
     return Agent(deps_type=AgentDeps, instructions=settings.system_prompt, tools=tools)
 
 

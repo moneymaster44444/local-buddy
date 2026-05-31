@@ -16,6 +16,7 @@ import asyncio
 import json
 import signal
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from openai import AsyncOpenAI
@@ -40,6 +41,7 @@ from .llm import (
     make_client,
 )
 from .loop import run_turn
+from .memory import EmbeddingError, MemorySearcher, MemoryStore, embed_texts, ingest_path
 from .state import Conversation
 from .tools import UNSANDBOXED_TOOLS, AgentDeps, build_tools
 from .tools.approval import Asker
@@ -62,7 +64,8 @@ class AppState:
     brain_agent: Agent
     utility_agent: Agent
     conversation: Conversation
-    deps: AgentDeps  # workspace sandbox + settings, injected into tools
+    deps: AgentDeps  # workspace sandbox + settings + memory, injected into tools
+    memory: MemorySearcher | None = None  # knowledge base (Phase 3); None if disabled
     allowed_tools: set[str] = field(default_factory=set)  # auto-approved this session
 
 
@@ -96,6 +99,9 @@ def print_help(console: Console) -> None:
     table.add_row("/model brain [id|#]", "Switch the brain (reasoning) model — picker if no id given")
     table.add_row("/model utility [id|#]", "Switch the utility (summary) model — picker if no id given")
     table.add_row("/tools [reset|revoke <tool>]", "List tools & approvals; revoke one or reset all session auto-approvals")
+    table.add_row("/ingest <path>", "Add a text/Markdown file or folder to the knowledge base (RAG)")
+    table.add_row("/memory", "Show knowledge base stats (chunks, sources, embedder)")
+    table.add_row("/forget", "Clear the knowledge base")
     table.add_row("/clear", "Clear the conversation history")
     table.add_row("/exit, /quit", "Leave LocalBuddy")
     console.print(table)
@@ -240,6 +246,16 @@ async def handle_command(
         else:
             print_tools(console, state)
         return False
+    if cmd == "/ingest":
+        rest = line.split(maxsplit=1)
+        await _handle_ingest(console, session, state, rest[1].strip() if len(rest) > 1 else "")
+        return False
+    if cmd == "/memory":
+        await _print_memory(console, state)
+        return False
+    if cmd == "/forget":
+        await _handle_forget(console, state)
+        return False
 
     console.print(f"[red]Unknown command:[/red] {cmd}  [dim](try /help)[/dim]")
     return False
@@ -374,7 +390,7 @@ def print_tools(console: Console, state: AppState) -> None:
     table.add_column("Tool")
     table.add_column("Approval")
     table.add_column("Description")
-    for tool in build_tools():
+    for tool in build_tools(state.settings):
         name = tool.function.__name__
         if name in state.allowed_tools:
             approval = "[dim]auto (session)[/dim]"
@@ -392,6 +408,107 @@ def print_tools(console: Console, state: AppState) -> None:
             f"[dim]auto-approved this session: {granted} — downshift with "
             "/tools revoke <tool>, or /tools reset for all.[/dim]"
         )
+
+
+# --- memory / RAG commands (Phase 3) ----------------------------------------
+
+
+def _auto_embedder(configured: str | None, available: list[str]) -> str | None:
+    """Resolve an embedder id without prompting: configured, else a lone 'embed' model."""
+    if configured and configured in available:
+        return configured
+    candidates = [m for m in available if "embed" in m.lower()]
+    return candidates[0] if len(candidates) == 1 else None
+
+
+async def _ensure_embedder(console: Console, session: PromptSession, state: AppState) -> bool:
+    """Ensure an embedder model is selected; auto-detect or pick interactively."""
+    mem = state.memory
+    if mem is None:
+        console.print("[yellow]Memory is disabled (LOCALBUDDY_ENABLE_MEMORY=false).[/yellow]")
+        return False
+    if mem.embedder_model_id:
+        return True
+    auto = _auto_embedder(state.settings.embedder_model_id, state.available)
+    if auto:
+        mem.embedder_model_id = auto
+        console.print(f"[dim]embedder: using [bold]{auto}[/bold][/dim]")
+        return True
+    try:
+        mem.embedder_model_id = await pick_model(console, session, "embedder", state.available, None)
+    except (EOFError, KeyboardInterrupt):
+        console.print("[dim](cancelled)[/dim]")
+        return False
+    return True
+
+
+async def _handle_ingest(
+    console: Console, session: PromptSession, state: AppState, raw_path: str
+) -> None:
+    mem = state.memory
+    if mem is None:
+        console.print("[yellow]Memory is disabled (LOCALBUDDY_ENABLE_MEMORY=false).[/yellow]")
+        return
+    if not raw_path:
+        console.print("[red]Usage:[/red] /ingest <path>   (a text/Markdown file or folder)")
+        return
+    path = Path(raw_path.strip().strip('"').strip("'")).expanduser()
+    if not path.exists():
+        console.print(f"[red]Path not found:[/red] {path}")
+        return
+    if not await _ensure_embedder(console, session, state):
+        return
+
+    async def embed(texts: list[str]) -> list[list[float]]:
+        return await embed_texts(state.client, mem.embedder_model_id, texts, state.settings.embed_batch_size)
+
+    try:
+        with console.status(f"[dim]ingesting {path}…[/dim]"):
+            result = await ingest_path(
+                mem.store, embed, path,
+                chunk_chars=state.settings.chunk_chars,
+                chunk_overlap=state.settings.chunk_overlap,
+            )
+    except EmbeddingError as exc:
+        console.print(f"[red]Ingestion failed:[/red] {exc}")
+        return
+
+    if result.chunks == 0:
+        console.print("[yellow]Nothing ingested[/yellow] — no supported text files, or all empty/undecodable.")
+    else:
+        console.print(f"[green]Ingested[/green] {result.chunks} chunk(s) from {result.files} file(s).")
+    if result.skipped:
+        console.print(f"[dim]skipped {len(result.skipped)} undecodable/binary file(s).[/dim]")
+    console.print(f"[dim]knowledge base now holds {await mem.count()} chunk(s).[/dim]")
+
+
+async def _handle_forget(console: Console, state: AppState) -> None:
+    mem = state.memory
+    if mem is None:
+        console.print("[yellow]Memory is disabled.[/yellow]")
+        return
+    cleared = await mem.store.clear()
+    console.print(f"[dim]Cleared the knowledge base ({cleared} chunk(s) removed).[/dim]")
+
+
+async def _print_memory(console: Console, state: AppState) -> None:
+    mem = state.memory
+    if mem is None:
+        console.print("[yellow]Memory is disabled (LOCALBUDDY_ENABLE_MEMORY=false).[/yellow]")
+        return
+    count = await mem.count()
+    embedder = mem.embedder_model_id or "(auto-select on first /ingest)"
+    console.print(f"[bold]Knowledge base:[/bold] {count} chunk(s)  •  embedder: [bold]{embedder}[/bold]")
+    if count:
+        table = Table(title="Ingested sources", header_style="bold")
+        table.add_column("#", justify="right")
+        table.add_column("source")
+        for i, src in enumerate(await mem.store.sources(), 1):
+            table.add_row(str(i), src)
+        console.print(table)
+    console.print(
+        f"[dim]/ingest <path> to add • /forget to clear • stored in {state.settings.lancedb_dir}[/dim]"
+    )
 
 
 async def run_turn_interruptible(console: Console, coro) -> None:
@@ -427,7 +544,7 @@ async def _run() -> int:
 
     console.print(
         Panel.fit(
-            "[bold]LocalBuddy[/bold] — local agent via LM Studio  [dim](Phase 2: tools)[/dim]",
+            "[bold]LocalBuddy[/bold] — local agent via LM Studio  [dim](Phase 3: tools + memory)[/dim]",
             border_style="green",
         )
     )
@@ -464,6 +581,16 @@ async def _run() -> int:
         return 130
 
     workspace = settings.workspace_path() if settings.enable_tools else settings.workspace_root
+
+    memory: MemorySearcher | None = None
+    if settings.enable_memory:
+        memory = MemorySearcher(
+            store=MemoryStore(settings.lancedb_dir),
+            client=client,
+            settings=settings,
+            embedder_model_id=_auto_embedder(settings.embedder_model_id, available),
+        )
+
     state = AppState(
         settings=settings,
         client=client,
@@ -475,7 +602,8 @@ async def _run() -> int:
         brain_agent=build_brain_agent(settings),
         utility_agent=build_utility_agent(),
         conversation=Conversation(settings=settings),
-        deps=AgentDeps(root=workspace, settings=settings),
+        deps=AgentDeps(root=workspace, settings=settings, memory=memory),
+        memory=memory,
     )
 
     limits = UsageLimits(
@@ -491,6 +619,9 @@ async def _run() -> int:
         console.print(f"[dim]tools enabled • workspace sandbox: {workspace}[/dim]")
     else:
         console.print("[dim]tools disabled[/dim]")
+    if settings.enable_memory and memory is not None:
+        emb = memory.embedder_model_id or "auto-select on first /ingest"
+        console.print(f"[dim]memory enabled • embedder: {emb} • /ingest <path> to add docs[/dim]")
     console.print("[dim]Type /help for commands. Enter sends • Alt+Enter for a newline.[/dim]")
 
     try:
