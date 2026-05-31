@@ -59,6 +59,16 @@ class Settings(BaseSettings):
     max_model_requests: int = 12  # max model calls per user turn (UsageLimits.request_limit)
     max_tool_calls: int = 24  # max tool executions per user turn (UsageLimits.tool_calls_limit)
 
+    # --- Memory / RAG (Phase 3) ---
+    enable_memory: bool = True  # register the search_memory tool + /ingest command
+    # Embedding model for the knowledge base. Resolved lazily (configured id, else
+    # an auto-detected "embed"-named model, else an interactive pick on /ingest).
+    embedder_model_id: str | None = None
+    chunk_chars: int = 1200  # target characters per chunk when ingesting
+    chunk_overlap: int = 200  # character overlap between consecutive chunks
+    rag_top_k: int = 5  # passages returned by a search_memory call
+    embed_batch_size: int = 32  # texts per embedding request
+
     # --- Persona ---
     system_prompt: str = (
         "You are LocalBuddy, a concise and helpful AI assistant running fully "
@@ -73,7 +83,11 @@ class Settings(BaseSettings):
         "and approves or denies it outside of your message. So just make the tool "
         "call; never say things like 'please approve'. If a call is denied you "
         "will receive a message saying so — then adapt. Prefer relative paths "
-        "within the workspace, and only use tools when they genuinely help."
+        "within the workspace, and only use tools when they genuinely help.\n\n"
+        "You also have a search_memory tool that searches the user's ingested "
+        "knowledge base (documents they added with /ingest). Use it when the "
+        "question might be answered by their documents, and ground your answer in "
+        "what it returns; if it returns nothing relevant, say so rather than guess."
     )
 
     # --- Paths ---
@@ -84,6 +98,10 @@ class Settings(BaseSettings):
     @property
     def history_file(self) -> Path:
         return self.data_dir / "repl_history.txt"
+
+    @property
+    def lancedb_dir(self) -> Path:
+        return self.data_dir / "lancedb"
 
     def ensure_dirs(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)

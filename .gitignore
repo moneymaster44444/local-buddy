@@ -24,6 +24,7 @@ workspace/
 
 # Editor / OS / local tooling
 .vscode/
+.vs/
 .idea/
 *.swp
 .DS_Store

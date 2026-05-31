@@ -6,10 +6,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from pydantic_ai import ModelRetry
 
 from ..config import Settings
+
+if TYPE_CHECKING:
+    from ..memory import MemorySearcher
 
 
 @dataclass
@@ -18,6 +22,7 @@ class AgentDeps:
 
     root: Path  # absolute, resolved workspace sandbox root
     settings: Settings
+    memory: "MemorySearcher | None" = None  # knowledge base for search_memory (Phase 3)
 
 
 def resolve_in_root(root: Path, path: str) -> Path:
