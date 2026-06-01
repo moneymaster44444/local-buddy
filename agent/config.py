@@ -42,7 +42,10 @@ class Settings(BaseSettings):
     history_token_budget: int = 6000  # estimated-token ceiling before summarizing
     keep_recent_turns: int = 4  # most-recent user+assistant turns kept verbatim
     chars_per_token: float = 4.0  # heuristic: ~4 chars/token (no tokenizer dependency)
-    summary_max_tokens: int = 512  # cap on the generated summary length
+    # Token budget for a summary generation call. Must leave room for a
+    # reasoning/"thinking" model to think AND emit the summary text (we keep only
+    # the text); too small and the model burns the budget before answering.
+    summary_max_tokens: int = 2048
 
     # --- Tools (Phase 2) ---
     enable_tools: bool = True  # set false for pure Phase-1 chat with no tools
@@ -68,6 +71,11 @@ class Settings(BaseSettings):
     chunk_overlap: int = 200  # character overlap between consecutive chunks
     rag_top_k: int = 5  # passages returned by a search_memory call
     embed_batch_size: int = 32  # texts per embedding request
+
+    # --- Durable sessions (Phase 4) ---
+    # The conversation is saved to SQLite after each turn so it survives exit/
+    # crash; /sessions lists past conversations and /resume reopens one.
+    persist_sessions: bool = True
 
     # --- Persona ---
     system_prompt: str = (
@@ -102,6 +110,10 @@ class Settings(BaseSettings):
     @property
     def lancedb_dir(self) -> Path:
         return self.data_dir / "lancedb"
+
+    @property
+    def session_db(self) -> Path:
+        return self.data_dir / "sessions.db"
 
     def ensure_dirs(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)

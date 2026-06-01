@@ -1,13 +1,14 @@
 # LocalBuddy
 
 A local-first command-line AI agent that talks to models served by **LM Studio**
-over its OpenAI-compatible API. **Phases 1–3** are built: an interactive,
+over its OpenAI-compatible API. **Phases 1–4** are built: an interactive,
 streaming chat REPL (model switching, reasoning/thinking display, rolling history
 summarization); tool calling — sandboxed filesystem, shell, and web-fetch tools
 driven through an agent loop, gated by an approval prompt for risky actions, with
-a per-turn iteration cap; and local RAG — ingest your documents, embed them via
+a per-turn iteration cap; local RAG — ingest your documents, embed them via
 LM Studio into a LanceDB store, and let the agent retrieve from them with a
-`search_memory` tool. Durable/resumable sessions arrive next (see Roadmap).
+`search_memory` tool; and durable sessions — every conversation is saved to
+SQLite, so `/sessions` and `/resume` reopen past chats with full context.
 
 ## Requirements
 
@@ -52,7 +53,9 @@ reports and asks you to choose a brain and a utility model.
 | `/remember [text]` | Save a note — or, with no text, a summary of this conversation — to memory |
 | `/memory` | Show knowledge base stats (chunks, sources, embedder) |
 | `/forget` | Clear the knowledge base |
-| `/clear` | Clear the conversation |
+| `/sessions [delete <#\|id>]` | List saved conversations (or delete one) |
+| `/resume [#\|id]` | Resume a saved conversation (most recent if no id) |
+| `/clear` | Start a new conversation (the previous one stays saved) |
 | `/exit`, `/quit` | Quit |
 
 Input keys: **Enter** sends, **Alt+Enter** inserts a newline, **Ctrl+C** cancels
@@ -113,8 +116,8 @@ Give LocalBuddy your own documents and let it retrieve from them:
 - **Remember:** `/remember <text>` saves a note; bare `/remember` summarizes the
   *current conversation* (via the utility model) and saves that — so a future
   session can recall the gist. Both are embedded and stored like any other entry,
-  tagged `note:<time>` / `conversation:<time>`. (Note: this is long-term recall via
-  RAG — *resuming* a whole session verbatim is Phase 4.)
+  tagged `note:<time>` / `conversation:<time>`. (This is long-term *recall* via
+  RAG; *resuming* a whole conversation verbatim is `/resume` — see Durable sessions.)
 - **Retrieve:** the agent has a read-only **`search_memory`** tool it calls when a
   question might be answered by your documents — it embeds the query, pulls the top
   matches, and grounds its answer in them (no approval needed; it's read-only).
@@ -122,6 +125,25 @@ Give LocalBuddy your own documents and let it retrieve from them:
   `*embed*` model, else an interactive pick on your first `/ingest`. Nothing is
   embedded (and no embedding model is loaded) until you ingest or the agent
   searches, so RAG adds no startup or VRAM cost until used.
+
+## Durable sessions (Phase 4)
+
+Every conversation is **saved to a local SQLite database** (`data/sessions.db`)
+after each completed turn, so it survives `/exit`, Ctrl+C, or a crash. Messages
+are serialized with pydantic-ai's `ModelMessagesTypeAdapter`, so tool calls and
+the full structure round-trip.
+
+- **`/sessions`** lists your saved conversations (newest first) with a short id,
+  timestamp, message count, and title. `/sessions delete <#|id>` removes one.
+- **`/resume <#|id>`** reopens a conversation with full context; bare `/resume`
+  reopens the most recent. You continue exactly where you left off.
+- **`/clear`** starts a *new* conversation — the previous one stays saved and
+  resumable.
+
+Partial/aborted turns are rolled back and never saved, so `/resume` always
+returns you to the last *completed* turn. Set `LOCALBUDDY_PERSIST_SESSIONS=false`
+to disable. (Distinct from the knowledge base: `/resume` brings back a
+*conversation*; `search_memory` brings back *knowledge*.)
 
 ## Configuration
 
@@ -144,6 +166,7 @@ environment variables). Notable settings:
 - `LOCALBUDDY_EMBEDDER_MODEL_ID` — pin the embedding model (else auto/interactive)
 - `LOCALBUDDY_CHUNK_CHARS` (default `1200`), `LOCALBUDDY_CHUNK_OVERLAP` (default `200`)
 - `LOCALBUDDY_RAG_TOP_K` (default `5`) — passages returned per `search_memory` call
+- `LOCALBUDDY_PERSIST_SESSIONS` (default `true`) — save/resume conversations via SQLite
 
 Token size is **estimated** with a `chars / 4` heuristic
 (`LOCALBUDDY_CHARS_PER_TOKEN`), so no model-specific tokenizer dependency is
@@ -155,13 +178,14 @@ needed.
 agent/
   config.py     # pydantic-settings configuration
   llm.py        # shared AsyncOpenAI client → LM Studio; model discovery + agent/model builders (UI-free)
-  state.py      # in-memory Conversation (pydantic-ai messages) + rolling summarization
+  state.py      # Conversation (pydantic-ai messages) + rolling summarization
   loop.py       # the agent step loop: stream → tools → approval → resume, with the iteration cap
+  checkpoint.py # SQLite session persistence: save / list / resume conversations (Phase 4)
   repl.py       # the REPL, commands, model picker, approval UI, bootstrap
   tools/        # filesystem, shell, webfetch, search_memory tools + the approval gate
   memory/       # embeddings (LM Studio), LanceDB store, ingest, retrieval (Phase 3)
   __main__.py   # `python -m agent` entry point
-data/           # repl history + LanceDB index (gitignored)
+data/           # repl history + LanceDB index + sessions.db (gitignored)
 workspace/      # filesystem sandbox for tools (gitignored)
 ```
 
@@ -181,6 +205,11 @@ answer, executes read-only tools inline, and — when the model calls a tool mar
 `requires_approval=True` — **pauses** the run (pydantic-ai's `DeferredToolRequests`
 human-in-the-loop mechanism), asks via the approval gate, then **resumes** with the
 results. The per-turn iteration cap is enforced with `UsageLimits`.
+
+After each completed turn the conversation is serialized and upserted into SQLite
+(`checkpoint.py`); `/resume` deserializes a saved session back into the live
+conversation. Because messages stay in pydantic-ai's own format, resumed sessions
+keep tool calls, summaries, and everything else intact.
 
 ## Manual test checklist
 
@@ -202,12 +231,17 @@ results. The per-turn iteration cap is enforced with `UsageLimits`.
     asked), then `/memory` shows the chunk count and source. Ask a question whose
     answer is in that file → the agent calls `search_memory` (you'll see a 🔧 line)
     and grounds its answer in the retrieved passage. `/forget` clears the index.
-11. Force summarization: set `LOCALBUDDY_HISTORY_TOKEN_BUDGET=300`, then hold a
+11. **Durable sessions:** have a short chat, tell it something specific, then
+    `/exit`. Relaunch → the startup line shows N saved conversation(s); `/sessions`
+    lists them; `/resume` (or `/resume <#>`) reopens the latest → ask it to recall
+    what you told it and it answers from the restored context.
+12. **New vs. resume:** `/clear` starts a fresh conversation (the old one stays in
+    `/sessions`); `/sessions delete <#>` removes one.
+13. Force summarization: set `LOCALBUDDY_HISTORY_TOKEN_BUDGET=300`, then hold a
     short conversation. Once the budget is exceeded you'll see
     `↳ summarized N older message(s)…` and the context stays bounded.
-12. `/clear` resets the conversation; `/exit` quits.
-13. Stop the LM Studio server and start LocalBuddy → you get a clear connection
-    error rather than a traceback.
+14. `/exit` quits; stop the LM Studio server and start LocalBuddy → you get a clear
+    connection error rather than a traceback.
 
 ## Roadmap
 
@@ -215,5 +249,5 @@ results. The per-turn iteration cap is enforced with `UsageLimits`.
 - **Phase 2 ✓** — filesystem / shell / web-fetch tools, the agent loop, an
   approval gate for risky calls, and a per-turn iteration cap
 - **Phase 3 ✓** — local RAG: chunk → embed (via LM Studio) → LanceDB, retrieved via a `search_memory` tool + `/ingest`
-- **Phase 4** — durable, resumable sessions persisted to SQLite
+- **Phase 4 ✓** — durable sessions persisted to SQLite, reopened with `/sessions` + `/resume`
 - **Deferred** — Phase 5 (daemon + scheduler), Phase 6 (MCP integrations)

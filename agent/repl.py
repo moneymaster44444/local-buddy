@@ -1,12 +1,14 @@
-"""Interactive streaming chat REPL for LocalBuddy (Phase 2).
+"""Interactive streaming chat REPL for LocalBuddy.
 
-Brings together config, the LM Studio clients, the in-memory conversation, and
-the tool loop:
+Brings together config, the LM Studio clients, the conversation, the tool loop,
+the knowledge base, and durable sessions:
 - streams the brain model's replies token-by-token with ``rich``
-- runs filesystem / shell / web-fetch tools through the agent loop (``loop.py``)
+- runs filesystem / shell / web-fetch / search_memory tools through the agent loop
 - gates risky tool calls behind an interactive approval prompt
 - reads input with ``prompt_toolkit`` (history, multiline via Alt+Enter)
-- supports ``/help``, ``/model``, ``/tools``, ``/clear``, ``/exit``
+- persists each conversation to SQLite; ``/sessions`` + ``/resume`` reopen them
+- supports ``/help``, ``/model``, ``/tools``, ``/ingest``, ``/remember``,
+  ``/sessions``, ``/resume``, ``/clear``, ``/exit``
 - condenses old turns via the utility model when the history grows too large
 """
 
@@ -32,6 +34,7 @@ from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 
+from .checkpoint import Session, SessionStore, derive_title, now_iso
 from .config import Settings
 from .llm import (
     LMStudioError,
@@ -73,6 +76,8 @@ class AppState:
     utility_agent: Agent
     conversation: Conversation
     deps: AgentDeps  # workspace sandbox + settings + memory, injected into tools
+    store: SessionStore | None = None  # SQLite session persistence (Phase 4); None if disabled
+    session: Session | None = None  # the current durable session
     memory: MemorySearcher | None = None  # knowledge base (Phase 3); None if disabled
     allowed_tools: set[str] = field(default_factory=set)  # auto-approved this session
 
@@ -111,7 +116,9 @@ def print_help(console: Console) -> None:
     table.add_row("/remember [text]", "Save a note (or, with no text, a summary of this conversation) to memory")
     table.add_row("/memory", "Show knowledge base stats (chunks, sources, embedder)")
     table.add_row("/forget", "Clear the knowledge base")
-    table.add_row("/clear", "Clear the conversation history")
+    table.add_row("/sessions [delete <#|id>]", "List saved conversations (or delete one)")
+    table.add_row("/resume [#|id]", "Resume a saved conversation (most recent if no id)")
+    table.add_row("/clear", "Start a new conversation (the previous one stays saved)")
     table.add_row("/exit, /quit", "Leave LocalBuddy")
     console.print(table)
     console.print(
@@ -228,7 +235,11 @@ async def handle_command(
         return False
     if cmd == "/clear":
         state.conversation.clear()
-        console.print("[dim]Conversation history cleared.[/dim]")
+        if state.store is not None:
+            state.session = Session.new()
+            console.print("[dim]Started a new conversation (the previous one is saved; /resume to return).[/dim]")
+        else:
+            console.print("[dim]Conversation history cleared.[/dim]")
         return False
     if cmd == "/model":
         await _handle_model_command(console, session, state, args)
@@ -268,6 +279,15 @@ async def handle_command(
         return False
     if cmd == "/forget":
         await _handle_forget(console, state)
+        return False
+    if cmd == "/sessions":
+        if args and args[0].lower() == "delete":
+            _handle_session_delete(console, state, args[1] if len(args) > 1 else "")
+        else:
+            print_sessions(console, state)
+        return False
+    if cmd == "/resume":
+        _handle_resume(console, state, args[0] if args else "")
         return False
 
     console.print(f"[red]Unknown command:[/red] {cmd}  [dim](try /help)[/dim]")
@@ -601,6 +621,111 @@ async def _print_memory(console: Console, state: AppState) -> None:
     )
 
 
+# --- session persistence commands (Phase 4) ---------------------------------
+
+
+def _fmt_time(iso: str) -> str:
+    try:
+        return datetime.fromisoformat(iso).astimezone().strftime("%Y-%m-%d %H:%M")
+    except ValueError:
+        return iso
+
+
+def _resolve_session(sessions: list[Session], arg: str) -> Session | None | str:
+    """'' -> most recent; '<#>' -> index; else id prefix. Returns Session, None, or 'ambiguous'."""
+    if not arg:
+        return sessions[0] if sessions else None
+    if arg.isdigit():
+        index = int(arg)
+        return sessions[index - 1] if 1 <= index <= len(sessions) else None
+    matches = [s for s in sessions if s.id.startswith(arg)]
+    if len(matches) == 1:
+        return matches[0]
+    return "ambiguous" if matches else None
+
+
+def print_sessions(console: Console, state: AppState) -> None:
+    if state.store is None:
+        console.print("[dim]Session persistence is disabled (LOCALBUDDY_PERSIST_SESSIONS=false).[/dim]")
+        return
+    sessions = state.store.list_sessions()
+    if not sessions:
+        console.print("[dim]No saved conversations yet.[/dim]")
+        return
+    table = Table(title="Saved conversations", header_style="bold")
+    table.add_column("#", justify="right")
+    table.add_column("id")
+    table.add_column("updated")
+    table.add_column("msgs", justify="right")
+    table.add_column("title")
+    for i, s in enumerate(sessions, 1):
+        current = " [green](current)[/green]" if state.session and s.id == state.session.id else ""
+        table.add_row(str(i), s.id[:8], _fmt_time(s.updated_at), str(s.message_count), escape(s.title) + current)
+    console.print(table)
+    console.print("[dim]/resume <#|id> to continue • /sessions delete <#|id> to remove[/dim]")
+
+
+def _handle_resume(console: Console, state: AppState, arg: str) -> None:
+    if state.store is None:
+        console.print("[dim]Session persistence is disabled.[/dim]")
+        return
+    sessions = state.store.list_sessions()
+    if not sessions:
+        console.print("[dim]No saved conversations to resume.[/dim]")
+        return
+    target = _resolve_session(sessions, arg)
+    if target == "ambiguous":
+        console.print(f"[red]'{arg}' matches more than one session.[/red] Use a longer id or a # from /sessions.")
+        return
+    if not isinstance(target, Session):
+        console.print(f"[red]No session matches '{arg}'.[/red] Use /sessions to list them.")
+        return
+    if state.session and target.id == state.session.id:
+        console.print("[dim]Already in that conversation.[/dim]")
+        return
+    state.conversation.messages = state.store.load_messages(target.id)
+    state.session = target
+    console.print(
+        f"[green]Resumed[/green] {target.id[:8]} ({target.message_count} message(s)): "
+        f"[dim]{escape(target.title)}[/dim]"
+    )
+
+
+def _handle_session_delete(console: Console, state: AppState, arg: str) -> None:
+    if state.store is None:
+        console.print("[dim]Session persistence is disabled.[/dim]")
+        return
+    if not arg:
+        console.print("[red]Usage:[/red] /sessions delete <#|id>")
+        return
+    target = _resolve_session(state.store.list_sessions(), arg)
+    if not isinstance(target, Session):
+        console.print(f"[red]No single session matches '{arg}'.[/red] Use /sessions to list them.")
+        return
+    state.store.delete(target.id)
+    note = f"[dim]Deleted session {target.id[:8]}.[/dim]"
+    if state.session and target.id == state.session.id:
+        state.conversation.clear()
+        state.session = Session.new()
+        note += " (it was the current one; started a new conversation)"
+    console.print(note)
+
+
+def _persist_session(console: Console, state: AppState) -> None:
+    """Save the current conversation after a completed turn (best-effort)."""
+    if state.store is None or state.session is None or not state.conversation.messages:
+        return
+    session = state.session
+    if not session.title:
+        session.title = derive_title(state.conversation.messages)
+    session.message_count = len(state.conversation.messages)
+    session.updated_at = now_iso()
+    try:
+        state.store.save(session, state.conversation.messages)
+    except Exception as exc:  # noqa: BLE001 - persistence must not kill the REPL
+        console.print(f"[yellow]⚠ could not save session: {exc}[/yellow]")
+
+
 async def run_turn_interruptible(console: Console, coro) -> None:
     """Run one turn as a task so Ctrl+C cancels just the turn, not the whole app.
 
@@ -634,7 +759,7 @@ async def _run() -> int:
 
     console.print(
         Panel.fit(
-            "[bold]LocalBuddy[/bold] — local agent via LM Studio  [dim](Phase 3: tools + memory)[/dim]",
+            "[bold]LocalBuddy[/bold] — local agent via LM Studio  [dim](Phase 4: durable sessions)[/dim]",
             border_style="green",
         )
     )
@@ -681,6 +806,8 @@ async def _run() -> int:
             embedder_model_id=_auto_embedder(settings.embedder_model_id, available),
         )
 
+    store = SessionStore(settings.session_db) if settings.persist_sessions else None
+
     state = AppState(
         settings=settings,
         client=client,
@@ -693,6 +820,8 @@ async def _run() -> int:
         utility_agent=build_utility_agent(),
         conversation=Conversation(settings=settings),
         deps=AgentDeps(root=workspace, settings=settings, memory=memory),
+        store=store,
+        session=Session.new(),
         memory=memory,
     )
 
@@ -712,6 +841,10 @@ async def _run() -> int:
     if settings.enable_memory and memory is not None:
         emb = memory.embedder_model_id or "auto-select on first /ingest"
         console.print(f"[dim]memory enabled • embedder: {emb} • /ingest <path> to add docs[/dim]")
+    if store is not None:
+        past = len(store.list_sessions())
+        hint = f"{past} saved conversation(s) • /sessions, /resume" if past else "conversations auto-save • /sessions, /resume"
+        console.print(f"[dim]{hint}[/dim]")
     console.print("[dim]Type /help for commands. Enter sends • Alt+Enter for a newline.[/dim]")
 
     try:
@@ -764,6 +897,7 @@ async def _run() -> int:
                     limits=limits,
                 ),
             )
+            _persist_session(console, state)
     finally:
         await client.close()
 
