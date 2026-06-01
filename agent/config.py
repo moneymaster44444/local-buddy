@@ -72,6 +72,11 @@ class Settings(BaseSettings):
     rag_top_k: int = 5  # passages returned by a search_memory call
     embed_batch_size: int = 32  # texts per embedding request
 
+    # --- Durable sessions (Phase 4) ---
+    # The conversation is saved to SQLite after each turn so it survives exit/
+    # crash; /sessions lists past conversations and /resume reopens one.
+    persist_sessions: bool = True
+
     # --- Persona ---
     system_prompt: str = (
         "You are LocalBuddy, a concise and helpful AI assistant running fully "
@@ -105,6 +110,10 @@ class Settings(BaseSettings):
     @property
     def lancedb_dir(self) -> Path:
         return self.data_dir / "lancedb"
+
+    @property
+    def session_db(self) -> Path:
+        return self.data_dir / "sessions.db"
 
     def ensure_dirs(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
